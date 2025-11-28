@@ -908,6 +908,150 @@ def api_summary():
         })
 
 
+@app.route('/divoom/power-data')
+def api_divoom_power_data():
+    """
+    Endpoint pour le cadre Divoom Times Frame
+    Retourne toutes les données de puissance au format JSON plat
+    """
+    try:
+        # Récupérer les données temps réel
+        today = now_tz().strftime('%Y-%m-%d')
+        stats = hyxi_client.get_plant_power_statistics(Config.PLANT_ID, today)
+        plant_info = hyxi_client.get_plant_info(Config.PLANT_ID)
+        
+        if stats.get('error') or plant_info.get('error'):
+            return jsonify(_get_empty_divoom_data())
+        
+        stats_data = stats.get('data', {})
+        plant_data = plant_info.get('data', {})
+        
+        # Extraire les données
+        yield_power = stats_data.get('yieldPower', [])
+        consume_power = stats_data.get('consumePower', [])
+        buy_power = stats_data.get('buyPower', [])
+        
+        # Calculs instantanés (dernière valeur)
+        current_production_w = yield_power[-1] if yield_power else 0
+        current_consumption_w = consume_power[-1] if consume_power else 0
+        current_bought_w = buy_power[-1] if buy_power else 0
+        
+        # Calculs du jour (kWh)
+        interval_hours = 5 / 60
+        daily_production_kwh = sum(p * interval_hours for p in yield_power) / 1000 if yield_power else 0
+        daily_consumption_kwh = sum(p * interval_hours for p in consume_power) / 1000 if consume_power else 0
+        daily_bought_kwh = sum(p * interval_hours for p in buy_power) / 1000 if buy_power else 0
+        
+        # Autoconsommation instantanée (production / consommation)
+        instant_autoconso_percent = 0
+        if current_consumption_w > 0:
+            instant_autoconso_percent = min((current_production_w / current_consumption_w) * 100, 100)
+        
+        # Autoconsommation du jour
+        daily_autoconso_percent = 0
+        if daily_production_kwh > 0:
+            if Config.RESALE_ENABLED:
+                # Calculé après le calcul du revenu
+                pass
+            else:
+                daily_autoconso_percent = min((daily_production_kwh / daily_consumption_kwh) * 100, 100) if daily_consumption_kwh > 0 else 100
+        
+        # Rendement panneaux (% de la capacité installée)
+        plant_capacity_kw = plant_data.get('capacity', 0)
+        instant_yield_percent = 0
+        daily_yield_percent = 0
+        
+        if plant_capacity_kw > 0:
+            instant_yield_percent = (current_production_w / 1000 / plant_capacity_kw) * 100
+            # Rendement journalier basé sur ensoleillement estimé
+            daylight_hours = get_daylight_hours(today)
+            max_production_kwh = plant_capacity_kw * daylight_hours
+            if max_production_kwh > 0:
+                daily_yield_percent = (daily_production_kwh / max_production_kwh) * 100
+        
+        # Tempo
+        tempo_today = TempoAPI.get_current_info()
+        tempo_tomorrow = TempoAPI.get_tomorrow_info()
+        
+        tempo_today_color = tempo_today.get('couleur', 'INCONNU') if tempo_today.get('success') else 'INCONNU'
+        tempo_tomorrow_color = tempo_tomorrow.get('couleur', 'INCONNU') if tempo_tomorrow.get('success') else 'INCONNU'
+        tempo_current_tarif = tempo_today.get('tarif_kwh', Config.TARIF_ACHAT) if tempo_today.get('success') else Config.TARIF_ACHAT
+        
+        # Économie du jour
+        tarif_achat = tempo_current_tarif
+        revenu_vente = 0
+        if Config.RESALE_ENABLED:
+            revenu_autoconso = 0
+            for i in range(len(yield_power)):
+                prod = yield_power[i] if i < len(yield_power) else 0
+                cons = consume_power[i] if i < len(consume_power) else 0
+                if prod >= cons:
+                    autoconso_kwh = (cons * interval_hours) / 1000
+                    surplus_kwh = ((prod - cons) * interval_hours) / 1000
+                    revenu_autoconso += autoconso_kwh * tarif_achat
+                    revenu_vente += surplus_kwh * Config.TARIF_VENTE
+                else:
+                    autoconso_kwh = (prod * interval_hours) / 1000
+                    revenu_autoconso += autoconso_kwh * tarif_achat
+            daily_savings_eur = revenu_autoconso + revenu_vente
+            
+            # Recalculer l'autoconso du jour en mode RESALE
+            if daily_production_kwh > 0 and revenu_vente > 0:
+                energie_vendue = revenu_vente / Config.TARIF_VENTE if Config.TARIF_VENTE > 0 else 0
+                daily_autoconso_percent = ((daily_production_kwh - energie_vendue) / daily_production_kwh) * 100
+        else:
+            daily_savings_eur = daily_production_kwh * tarif_achat
+        
+        # Retourner le JSON plat formaté pour Divoom
+        return jsonify({
+            # Tempo
+            'tempo_today_color': tempo_today_color,
+            'tempo_tomorrow_color': tempo_tomorrow_color,
+            'tempo_current_tarif': round(tempo_current_tarif, 4),
+            
+            # Instantané (en W, arrondi entier)
+            'instant_production_w': int(round(current_production_w, 0)),
+            'instant_consumption_w': int(round(current_consumption_w, 0)),
+            'instant_bought_w': int(round(current_bought_w, 0)),
+            'instant_autoconso_percent': round(instant_autoconso_percent, 1),
+            'instant_yield_percent': round(instant_yield_percent, 1),
+            
+            # Cumul du jour
+            'daily_savings_eur': round(daily_savings_eur, 1),
+            'daily_production_kwh': round(daily_production_kwh, 1),
+            'daily_consumption_kwh': round(daily_consumption_kwh, 1),
+            'daily_bought_kwh': round(daily_bought_kwh, 1),
+            'daily_autoconso_percent': round(daily_autoconso_percent, 1),
+            'daily_yield_percent': round(daily_yield_percent, 1)
+        })
+        
+    except Exception as e:
+        print(f"Erreur endpoint Divoom: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify(_get_empty_divoom_data()), 500
+
+
+def _get_empty_divoom_data():
+    """Retourne des données vides en cas d'erreur"""
+    return {
+        'tempo_today_color': 'INCONNU',
+        'tempo_tomorrow_color': 'INCONNU',
+        'tempo_current_tarif': 0,
+        'instant_production_w': 0,
+        'instant_consumption_w': 0,
+        'instant_bought_w': 0,
+        'instant_autoconso_percent': 0,
+        'instant_yield_percent': 0,
+        'daily_savings_eur': 0,
+        'daily_production_kwh': 0,
+        'daily_consumption_kwh': 0,
+        'daily_bought_kwh': 0,
+        'daily_autoconso_percent': 0,
+        'daily_yield_percent': 0
+    }
+
+
 @app.errorhandler(404)
 def not_found(error):
     """Gestion des erreurs 404"""
