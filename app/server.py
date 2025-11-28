@@ -908,7 +908,7 @@ def api_summary():
         })
 
 
-@app.route('/api/divoom/power-data')
+@app.route('/divoom/power-data')
 def api_divoom_power_data():
     """
     Endpoint pour le cadre Divoom Times Frame
